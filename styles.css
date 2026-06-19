@@ -1,0 +1,32 @@
+.card { 
+    background: white; 
+    border-radius: 12px; 
+    box-shadow: 0 1px 3px rgba(0,0,0,0.1); 
+    border: 1px solid #e2e8f0; 
+}
+
+.input-field {
+    width: 100%; padding: 0.75rem; border: 1px solid #cbd5e1; 
+    border-radius: 8px; outline: none; transition: all 0.2s;
+}
+.input-field:focus { border-color: #2563eb; ring: 2px solid #bfdbfe; }
+
+.btn-primary {
+    background: #0F172A; color: white; font-weight: 600; padding: 0.75rem; 
+    border-radius: 8px; transition: all 0.2s; display: flex; align-items: center; justify-content: center;
+}
+.btn-primary:hover:not(:disabled) { background: #1e293b; }
+.btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.btn-secondary {
+    background: #f1f5f9; color: #334155; font-weight: 500; padding: 0.75rem; 
+    border-radius: 8px; border: 1px solid #e2e8f0; transition: all 0.2s;
+}
+.btn-secondary:hover { background: #e2e8f0; }
+
+.hidden-section { display: none; }
+.active-section { display: block; animation: fadeIn 0.4s ease-out; }
+@keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+
+.custom-scroll::-webkit-scrollbar { width: 4px; }
+.custom-scroll::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }

@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SafeGuardian | Operaciones</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body class="bg-slate-50 text-slate-800 font-sans antialiased min-h-screen flex flex-col">
+
+    <!-- HEADER CORPORATIVO -->
+    <header class="bg-[#0F172A] text-white px-6 py-4 flex justify-between items-center shadow-md sticky top-0 z-50">
+        <div class="flex items-center gap-3">
+            <i data-lucide="shield-check" class="text-emerald-500 w-7 h-7"></i>
+            <h1 class="text-lg font-bold tracking-wide">RoadGuardian AI</h1>
+        </div>
+        <div id="system-status" class="flex items-center gap-2 bg-slate-800 px-3 py-1 rounded-full border border-slate-700 text-xs">
+            <div class="w-2 h-2 rounded-full bg-slate-500" id="status-dot"></div>
+            <span id="status-text">SISTEMA EN ESPERA</span>
+        </div>
+    </header>
+
+    <main class="flex-grow p-6 max-w-4xl mx-auto w-full">
+        
+        <!-- FASE 1: REGISTRO OPERATIVO -->
+        <section id="phase-register" class="card max-w-md mx-auto mt-12 active-section">
+            <div class="text-center mb-6">
+                <div class="w-16 h-16 bg-blue-50 text-blue-600 rounded-full flex items-center justify-center mx-auto mb-3">
+                    <i data-lucide="user-plus" class="w-8 h-8"></i>
+                </div>
+                <h2 class="text-xl font-bold">Nuevo Recorrido</h2>
+                <p class="text-sm text-slate-500 mt-1">Vincular conductor y unidad al sistema </p>
+            </div>
+            <form id="driver-form" class="space-y-4">
+                <input type="text" id="d-name" required placeholder="Nombre Completo" class="input-field">
+                <div class="grid grid-cols-2 gap-4">
+                    <input type="text" id="d-id" required placeholder="ID Conductor" class="input-field">
+                    <input type="text" id="d-plate" required placeholder="Placa Vehículo" class="input-field">
+                </div>
+                <select id="d-route" class="input-field">
+                    <option value="Ruta A: Terminal-Centro">Ruta A: Terminal-Centro</option>
+                    <option value="Ruta B: Norte-Sur">Ruta B: Norte-Sur</option>
+                    <option value="Ruta C: Circunvalar">Ruta C: Circunvalar</option>
+                </select>
+                <button type="submit" class="btn-primary w-full mt-2">
+                    <i data-lucide="play-circle" class="w-4 h-4 inline mr-2"></i> Iniciar Monitoreo
+                </button>
+            </form>
+        </section>
+
+        <!-- FASE 2: CAPTURA DE EVIDENCIAS (YOLO/n8n) -->
+        <section id="phase-monitor" class="hidden-section space-y-6">
+            <div class="card flex justify-between items-center p-4 bg-white border-l-4 border-l-blue-600">
+                <div>
+                    <p class="text-xs text-slate-500 uppercase font-bold">Conductor Activo</p>
+                    <p class="font-bold text-slate-900" id="monitor-driver-name">--</p>
+                </div>
+                <div class="text-right">
+                    <p class="text-xs text-slate-500 uppercase font-bold">Estado Conexión</p>
+                    <p class="text-sm font-mono font-bold text-emerald-600" id="api-status">CONECTADO</p>
+                </div>
+            </div>
+
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                <!-- Panel Izquierdo: Cámara / Previsualización -->
+                <div class="camera-container relative aspect-video bg-black rounded-xl overflow-hidden shadow-lg">
+                    <video id="webcam-feed" autoplay playsinline muted class="w-full h-full object-cover opacity-80 hidden"></video>
+                    <img id="preview-media" class="w-full h-full object-cover hidden" alt="Evidencia">
+                    
+                    <div class="absolute inset-0 flex items-center justify-center pointer-events-none" id="upload-placeholder">
+                        <p class="text-slate-400 text-sm">Sin evidencia cargada</p>
+                    </div>
+
+                    <div class="absolute bottom-0 left-0 right-0 p-4 bg-gradient-to-t from-black/90 to-transparent">
+                        <p class="text-[10px] text-slate-300 font-mono">FORMATO: IMG/JPG O VIDEO MP4 (MAX 5s)</p>
+                    </div>
+                </div>
+
+                <!-- Panel Derecho: Controles y Logs n8n -->
+                <div class="space-y-4">
+                    <div class="card p-4">
+                        <h3 class="text-sm font-bold text-slate-800 mb-3 uppercase tracking-wide">Capturar Evidencia</h3>
+                        
+                        <div class="flex gap-2 mb-4">
+                            <button onclick="toggleCamera()" id="btn-camera" class="btn-secondary flex-1">
+                                <i data-lucide="camera" class="w-4 h-4 inline mr-1"></i> Webcam
+                            </button>
+                            <label class="btn-secondary flex-1 cursor-pointer text-center">
+                                <i data-lucide="upload" class="w-4 h-4 inline mr-1"></i> Subir Archivo
+                                <input type="file" id="file-input" accept="image/*,video/mp4" class="hidden" onchange="handleFileUpload(this)">
+                            </label>
+                        </div>
+
+                        <button onclick="sendToN8n()" id="btn-analyze" disabled class="btn-primary w-full opacity-50 cursor-not-allowed">
+                            <i data-lucide="send" class="w-4 h-4 inline mr-2"></i> Enviar a Análisis 
+                        </button>
+                    </div>
+
+                    <div class="card p-4 border-l-4 border-l-orange-500 h-48 overflow-y-auto custom-scroll">
+                        <h3 class="text-xs font-bold text-slate-500 uppercase mb-2">Logs de Automatización</h3>
+                        <div id="n8n-logs" class="space-y-1 text-xs font-mono">
+                            <div class="text-slate-400 italic">Esperando envío de evidencia...</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <button onclick="finishTrip()" class="w-full bg-slate-800 hover:bg-slate-900 text-white font-bold py-3 rounded-xl transition flex items-center justify-center gap-2">
+                <i data-lucide="square" class="w-5 h-5 fill-current"></i> Finalizar Recorrido y Ver Reporte
+            </button>
+        </section>
+
+        <!-- FASE 3: REPORTE FINAL -->
+        <section id="phase-report" class="hidden-section card max-w-2xl mx-auto mt-10">
+            <div class="text-center mb-8">
+                <div class="w-20 h-20 bg-emerald-50 text-emerald-600 rounded-full flex items-center justify-center mx-auto mb-4">
+                    <i data-lucide="file-check" class="w-10 h-10"></i>
+                </div>
+                <h2 class="text-2xl font-bold text-slate-900">Recorrido Finalizado</h2>
+                <p class="text-sm text-slate-500 mt-1">Resumen procesado por Motor de Riesgo </p>
+            </div>
+
+            <div class="grid grid-cols-2 gap-4 mb-6">
+                <div class="bg-slate-50 p-4 rounded-lg border border-slate-200 text-center">
+                    <p class="text-xs text-slate-500 uppercase font-bold mb-1">Total Evidencias</p>
+                    <p class="text-2xl font-bold text-slate-900" id="report-total">0</p>
+                </div>
+                <div class="bg-slate-50 p-4 rounded-lg border border-slate-200 text-center">
+                    <p class="text-xs text-slate-500 uppercase font-bold mb-1">Riesgo Promedio</p>
+                    <p class="text-2xl font-bold text-emerald-600" id="report-risk">BAJO</p>
+                </div>
+            </div>
+
+            <div class="bg-slate-50 p-5 rounded-lg border border-slate-200 mb-6">
+                <h3 class="text-sm font-bold text-slate-800 mb-3 uppercase">Historial de Eventos</h3>
+                <table class="w-full text-xs text-left">
+                    <thead class="text-slate-500 border-b border-slate-200">
+                        <tr><th class="pb-2">Hora</th><th class="pb-2">Tipo</th><th class="pb-2 text-right">Estado</th></tr>
+                    </thead>
+                    <tbody id="report-table-body" class="text-slate-700"></tbody>
+                </table>
+            </div>
+
+            <button onclick="location.reload()" class="w-full btn-primary">Iniciar Nuevo Recorrido</button>
+        </section>
+
+    </main>
+
+    <script src="script.js"></script>
+</body>
+</html>
