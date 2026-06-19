@@ -1,0 +1,1035 @@
+{
+  "name": "SafeRoad AI Copilot — SafeGuardian Webapp Edition (Webhook + Sheets + Gmail + Telegram)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "roadguardian-analyze",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "fffcd4c2-c563-4d3e-b665-47d7fd76cef1",
+      "name": "Webhook RoadGuardian",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        2736,
+        1248
+      ],
+      "webhookId": "roadguardian-analyze"
+    },
+    {
+      "parameters": {
+        "jsCode": "\n// Payload real enviado por SafeGuardian (app.js -> sendToN8NWebhook -> generatePayload)\nconst body = $json.body || $json;\n\nconst required = ['driver', 'vehicle', 'route', 'analysis', 'alert', 'timestamp'];\nconst missing = required.filter(k => body[k] === undefined || body[k] === null);\n\nif (missing.length > 0) {\n  throw new Error('Validación fallida. Campos faltantes: ' + missing.join(', '));\n}\nif (!body.driver.id) {\n  throw new Error('Validación fallida. driver.id es obligatorio');\n}\n\nreturn [{ json: body }];\n"
+      },
+      "id": "1fcb0af3-570b-4a28-8f35-580741a93fa2",
+      "name": "Validación Entrada",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [
+        2960,
+        1248
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst staticData = $getWorkflowStaticData('global');\nif (!staticData.recentEvents) staticData.recentEvents = {};\n\nconst item = $input.first().json;\nconst key = `${item.driver.id}_${item.alert.type}_${item.alert.severity}`;\nconst now = Date.now();\nconst WINDOW_MS = 15000; // 15s anti-flood\n\nconst last = staticData.recentEvents[key];\nif (last && (now - last) < WINDOW_MS) {\n  return []; // descarta duplicado -> corta el flujo\n}\n\nstaticData.recentEvents[key] = now;\nreturn [{ json: item }];\n"
+      },
+      "id": "26ac932f-2864-40b7-8280-2c6725ea1bc1",
+      "name": "Control Duplicados",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [
+        3184,
+        1248
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst staticData = $getWorkflowStaticData('global');\nif (!staticData.rateLimit) staticData.rateLimit = {};\n\nconst item = $input.first().json;\nconst driver = item.driver.id;\nconst now = Date.now();\nconst WINDOW_MS = 60000; // 1 min\nconst MAX_EVENTS = 10;\n\nif (!staticData.rateLimit[driver]) staticData.rateLimit[driver] = [];\nstaticData.rateLimit[driver] = staticData.rateLimit[driver].filter(t => now - t < WINDOW_MS);\n\nif (staticData.rateLimit[driver].length >= MAX_EVENTS) {\n  throw new Error(`Rate limit excedido para driver_id=${driver}`);\n}\n\nstaticData.rateLimit[driver].push(now);\nreturn [{ json: item }];\n"
+      },
+      "id": "e6ad9f35-dba6-4307-ac0c-a69bba00436b",
+      "name": "Rate Limiting",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [
+        3408,
+        1248
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst item = $input.first().json;\n\nconst yolo = item.analysis.model_yolo || { detections: [] };\nconst voxel = item.analysis.model_voxel51 || { labels: [], severity_score: 0 };\nconst alert = item.alert || {};\n\nconst detections = yolo.detections || [];\nconst avgConfidence = detections.length\n  ? detections.reduce((a, d) => a + (d.confidence || 0), 0) / detections.length\n  : 0.5;\n\n// risk_factors derivados de las labels de Voxel51 + clases YOLO\nconst riskFactors = [...new Set([\n  ...(voxel.labels || []),\n  ...detections.map(d => d.class)\n])];\n\nconst normalized = {\n  driver_id: item.driver.id,\n  driver_name: item.driver.name,\n  vehicle_plate: item.vehicle.plate,\n  timestamp: item.timestamp,\n  source: item.event_origin || 'safeguardian_webapp',\n  incident_type: alert.type || 'unknown',\n  risk_factors: riskFactors,\n  confidence: Number(avgConfidence.toFixed(2)),\n  severity: alert.severity || 'INFO',\n  voxel_score: voxel.severity_score || 0,\n  risk_score: 0, // se calcula en Motor de Riesgo\n  summary: alert.message || '',\n  sector: item.route.sector || item.route.name,\n  coordinates: item.route.current_coordinates || {},\n  raw: item\n};\n\nreturn [{ json: normalized }];\n"
+      },
+      "id": "9fb197fd-915a-47d9-b310-095e1e0ae3a0",
+      "name": "Normalización JSON",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [
+        3616,
+        1248
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst item = $input.first().json;\n\nconst weights = { fatiga: 0.35, distraccion: 0.30, incidente: 0.20, confianza: 0.15 };\n\nconst fatigueKeywords = ['drowsiness', 'eyes_closed', 'fatigue', 'head_tilt'];\nconst distractionKeywords = ['distraction', 'no_helmet', 'pedestrian', 'collision', 'phone'];\n\nconst fatigueScore = item.risk_factors.some(f => fatigueKeywords.some(k => f.includes(k))) ? 100 : 0;\nconst distractionScore = item.risk_factors.some(f => distractionKeywords.some(k => f.includes(k))) ? 100 : 0;\n\n// Severidad reportada por Voxel51/alert ya trae un veredicto -> mapeo directo\nconst severityMap = { CRITICAL: 100, WARNING: 60, INFO: 10 };\nconst incidentScore = severityMap[item.severity] ?? (item.voxel_score * 10);\n\nconst confidenceScore = item.confidence * 100;\n\nlet riskScore =\n  fatigueScore * weights.fatiga +\n  distractionScore * weights.distraccion +\n  incidentScore * weights.incidente +\n  confidenceScore * weights.confianza;\n\n// Si Voxel51 ya marcó CRITICAL, garantizamos que cruce el umbral de alerta\nif (item.severity === 'CRITICAL') {\n  riskScore = Math.max(riskScore, 75);\n}\n\nitem.risk_score = Math.round(riskScore);\nreturn [{ json: item }];\n"
+      },
+      "id": "f5029bba-8450-43c5-b625-d2aefbf1c5f2",
+      "name": "Motor de Riesgo",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [
+        3840,
+        1248
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "cond1",
+              "leftValue": "={{ $json.risk_score }}",
+              "rightValue": 50,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "11016f90-1ad8-41be-beea-e7743704ee29",
+      "name": "IF RiskScore > 70",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        4080,
+        1248
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "1",
+              "name": "driver_id",
+              "type": "string",
+              "value": "={{ $json.driver_id }}"
+            },
+            {
+              "id": "2",
+              "name": "driver_name",
+              "type": "string",
+              "value": "={{ $json.driver_name }}"
+            },
+            {
+              "id": "3",
+              "name": "vehicle_plate",
+              "type": "string",
+              "value": "={{ $json.vehicle_plate }}"
+            },
+            {
+              "id": "4",
+              "name": "timestamp",
+              "type": "string",
+              "value": "={{ $json.timestamp }}"
+            },
+            {
+              "id": "5",
+              "name": "incident_type",
+              "type": "string",
+              "value": "={{ $json.incident_type }}"
+            },
+            {
+              "id": "6",
+              "name": "risk_score",
+              "type": "number",
+              "value": "={{ $json.risk_score }}"
+            },
+            {
+              "id": "7",
+              "name": "summary",
+              "type": "string",
+              "value": "={{ $json.summary }}"
+            },
+            {
+              "id": "8",
+              "name": "sector",
+              "type": "string",
+              "value": "={{ $json.sector }}"
+            },
+            {
+              "id": "9",
+              "name": "lat",
+              "type": "string",
+              "value": "={{ $json.coordinates.latitude }}"
+            },
+            {
+              "id": "10",
+              "name": "lng",
+              "type": "string",
+              "value": "={{ $json.coordinates.longitude }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "a1d05f78-d00b-4125-961b-c2dcf17c3a76",
+      "name": "Preparar Registro Crítico",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        4288,
+        1088
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "=TU_CHAT_ID_DE_TELEGRAM",
+        "text": "=🚨 *ALERTA CRÍTICA - SafeRoad AI*\\n\\n👤 Conductor: {{ $json.driver_name }} ({{ $json.driver_id }})\\n🚗 Placa: {{ $json.vehicle_plate }}\\n⚠️ Incidente: {{ $json.incident_type }}\\n📊 Risk Score: {{ $json.risk_score }}\\n📍 Sector: {{ $json.sector }}\\n🌐 Coordenadas: {{ $json.lat }}, {{ $json.lng }}\\n🕒 {{ $json.timestamp }}\\n📝 {{ $json.summary }}",
+        "additionalFields": {
+          "parse_mode": "Markdown"
+        }
+      },
+      "id": "abaf5707-be6b-4680-8c42-50ff98c046a4",
+      "name": "Notificación Telegram Supervisor",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1,
+      "position": [
+        4576,
+        912
+      ],
+      "webhookId": "aee9d22f-53e2-443e-82dc-ca9b342d7f15",
+      "credentials": {
+        "telegramApi": {
+          "id": "54axKGfc5RFrqgkd",
+          "name": "Unnamed credential"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "sendTo": "=correo-del-supervisor@ejemplo.com",
+        "subject": "=🚨 Alerta crítica SafeRoad AI - {{ $json.driver_name }} ({{ $json.vehicle_plate }})",
+        "message": "=<h2>Alerta crítica de riesgo</h2><p><b>Conductor:</b> {{ $json.driver_name }} ({{ $json.driver_id }})</p><p><b>Vehículo:</b> {{ $json.vehicle_plate }}</p><p><b>Incidente:</b> {{ $json.incident_type }}</p><p><b>Risk Score:</b> {{ $json.risk_score }}</p><p><b>Sector:</b> {{ $json.sector }}</p><p><b>Coordenadas:</b> {{ $json.lat }}, {{ $json.lng }}</p><p><b>Fecha:</b> {{ $json.timestamp }}</p><p><b>Resumen:</b> {{ $json.summary }}</p>",
+        "options": {}
+      },
+      "id": "1cf67d7b-1b82-40dd-9e5b-1a09d3a441a1",
+      "name": "Email Supervisor (Gmail)",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        4544,
+        1104
+      ],
+      "webhookId": "c18e60f7-e6ca-4d43-84b5-a3760aabb992",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "ZxFyvY9CUkjaLibS",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "=TU_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "gid=0",
+          "mode": "list",
+          "cachedResultName": "Hoja 1",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/TU_GOOGLE_SHEET_ID/edit#gid=0"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "workflow",
+              "displayName": "workflow",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "node",
+              "displayName": "node",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "error_message",
+              "displayName": "error_message",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "timestamp",
+              "displayName": "timestamp",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "e1ce290a-e917-4059-bb2d-a0b54d337390",
+      "name": "Registro Incidente Crítico (Sheets)",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        4496,
+        1312
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "pO39nbdgKkFOMYIE",
+          "name": "Google Sheets OAuth2 API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "1",
+              "name": "evidence_logged",
+              "type": "boolean",
+              "value": true
+            },
+            {
+              "id": "2",
+              "name": "driver_id",
+              "type": "string",
+              "value": "={{ $json.driver_id }}"
+            },
+            {
+              "id": "3",
+              "name": "risk_score",
+              "type": "number",
+              "value": "={{ $json.risk_score }}"
+            },
+            {
+              "id": "4",
+              "name": "summary",
+              "type": "string",
+              "value": "={{ $json.summary }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "52f4870a-42c5-49bc-b4ee-3ebdc5519b83",
+      "name": "Evidencia Almacenada (Log URL)",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        4768,
+        1312
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "1",
+              "name": "driver_id",
+              "type": "string",
+              "value": "={{ $json.driver_id }}"
+            },
+            {
+              "id": "2",
+              "name": "driver_name",
+              "type": "string",
+              "value": "={{ $json.driver_name }}"
+            },
+            {
+              "id": "3",
+              "name": "timestamp",
+              "type": "string",
+              "value": "={{ $json.timestamp }}"
+            },
+            {
+              "id": "4",
+              "name": "incident_type",
+              "type": "string",
+              "value": "={{ $json.incident_type }}"
+            },
+            {
+              "id": "5",
+              "name": "risk_score",
+              "type": "number",
+              "value": "={{ $json.risk_score }}"
+            },
+            {
+              "id": "6",
+              "name": "summary",
+              "type": "string",
+              "value": "={{ $json.summary }}"
+            },
+            {
+              "id": "7",
+              "name": "sector",
+              "type": "string",
+              "value": "={{ $json.sector }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "4be5e9ed-d6f6-46a8-8f97-c5ec3cc2ccb8",
+      "name": "Preparar Registro Normal",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        4272,
+        1632
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "=TU_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "gid=0",
+          "mode": "list",
+          "cachedResultName": "Hoja 1",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/TU_GOOGLE_SHEET_ID/edit#gid=0"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "workflow",
+              "displayName": "workflow",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "node",
+              "displayName": "node",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "error_message",
+              "displayName": "error_message",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "timestamp",
+              "displayName": "timestamp",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "062badaf-816c-413f-8171-de45ee72b525",
+      "name": "Registro Evento Normal (Sheets)",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        4528,
+        1648
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "pO39nbdgKkFOMYIE",
+          "name": "Google Sheets OAuth2 API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst item = $input.first().json;\nreturn [{\n  json: {\n    driver_id: item.driver_id,\n    timestamp: new Date().toISOString(),\n    action: item.risk_score > 70 ? 'ALERTA_CRITICA_GENERADA' : 'EVENTO_NORMAL_REGISTRADO',\n    risk_score: item.risk_score || 0,\n    details: item.summary || ''\n  }\n}];\n"
+      },
+      "id": "e6aec8ed-e838-4efe-9213-70ccc1d859be",
+      "name": "Log Auditoría",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [
+        5184,
+        1424
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "=TU_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "gid=0",
+          "mode": "list",
+          "cachedResultName": "Hoja 1",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/TU_GOOGLE_SHEET_ID/edit#gid=0"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {
+            "driver_id": "={{ $json.driver_id }}",
+            "timestamp": "={{ $json.timestamp }}",
+            "risk_score": "={{ $json.risk_score }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "workflow",
+              "displayName": "workflow",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "node",
+              "displayName": "node",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "error_message",
+              "displayName": "error_message",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "timestamp",
+              "displayName": "timestamp",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "driver_id",
+              "displayName": "driver_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "driver_name",
+              "displayName": "driver_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "vehicle_plate",
+              "displayName": "vehicle_plate",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "incident_type",
+              "displayName": "incident_type",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "risk_score",
+              "displayName": "risk_score",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "summary",
+              "displayName": "summary",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "sector",
+              "displayName": "sector",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "lat",
+              "displayName": "lat",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "lng",
+              "displayName": "lng",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "d273e155-2fea-41a9-ae33-06a903f6f798",
+      "name": "Insertar Audit Log (Sheets)",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        5408,
+        1456
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "pO39nbdgKkFOMYIE",
+          "name": "Google Sheets OAuth2 API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { status: 'ok', risk_score: $json.risk_score, action: $json.action } }}",
+        "options": {}
+      },
+      "id": "7ce00629-8d70-4e34-bc87-2a891186942b",
+      "name": "Respond Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        5680,
+        1488
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "3c45225e-38c2-4100-8ebc-06d5cfcb1e68",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        2960,
+        1936
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst exec = $json;\nreturn [{\n  json: {\n    workflow: exec.workflow?.name || 'SafeRoad AI Copilot',\n    node: exec.execution?.lastNodeExecuted || 'desconocido',\n    error_message: exec.execution?.error?.message || JSON.stringify(exec).slice(0,500),\n    timestamp: new Date().toISOString()\n  }\n}];\n"
+      },
+      "id": "73124cb3-3186-4689-9d39-031af4b81c7a",
+      "name": "Formatear Error",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [
+        3184,
+        1936
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "=TU_CHAT_ID_DE_TELEGRAM",
+        "text": "=⚠️ *Error en SafeRoad AI Copilot*\\n\\nNodo: {{ $json.node }}\\nError: {{ $json.error_message }}\\nFecha: {{ $json.timestamp }}",
+        "additionalFields": {
+          "parse_mode": "Markdown"
+        }
+      },
+      "id": "5dcb7f0a-9212-452a-b7dc-ea73f324a416",
+      "name": "Notificar Error a DevOps",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1,
+      "position": [
+        3408,
+        1856
+      ],
+      "webhookId": "fcf82521-89a3-47d4-ac88-ea2cd5065755",
+      "credentials": {
+        "telegramApi": {
+          "id": "54axKGfc5RFrqgkd",
+          "name": "Unnamed credential"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "sendTo": "=correo-del-supervisor@ejemplo.com",
+        "subject": "=⚠️ Error en flujo SafeRoad AI - {{ $json.node }}",
+        "message": "=<p><b>Nodo:</b> {{ $json.node }}</p><p><b>Error:</b> {{ $json.error_message }}</p><p><b>Fecha:</b> {{ $json.timestamp }}</p>",
+        "options": {}
+      },
+      "id": "6dd07332-f38b-4899-9dc6-0464970341b5",
+      "name": "Email Error (Gmail)",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        3408,
+        2016
+      ],
+      "webhookId": "e9c42c6b-df71-4649-ace4-3848c25f5c46",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "ZxFyvY9CUkjaLibS",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "=TU_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "gid=0",
+          "mode": "list",
+          "cachedResultName": "Hoja 1",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/TU_GOOGLE_SHEET_ID/edit#gid=0"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "driver_id": "SYSTEM",
+            "timestamp": "={{ $json.timestamp }}",
+            "action": "ERROR",
+            "risk_score": 0,
+            "details": "={{ $json.node }}: {{ $json.error_message }}"
+          }
+        },
+        "options": {}
+      },
+      "id": "97867c5f-efac-4723-b74b-1f59380306b6",
+      "name": "Log Error (Sheets)",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        3616,
+        1936
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "pO39nbdgKkFOMYIE",
+          "name": "Google Sheets OAuth2 API"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook RoadGuardian": {
+      "main": [
+        [
+          {
+            "node": "Validación Entrada",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validación Entrada": {
+      "main": [
+        [
+          {
+            "node": "Control Duplicados",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Control Duplicados": {
+      "main": [
+        [
+          {
+            "node": "Rate Limiting",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rate Limiting": {
+      "main": [
+        [
+          {
+            "node": "Normalización JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalización JSON": {
+      "main": [
+        [
+          {
+            "node": "Motor de Riesgo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Motor de Riesgo": {
+      "main": [
+        [
+          {
+            "node": "IF RiskScore > 70",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF RiskScore > 70": {
+      "main": [
+        [
+          {
+            "node": "Preparar Registro Crítico",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Preparar Registro Normal",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Preparar Registro Crítico": {
+      "main": [
+        [
+          {
+            "node": "Notificación Telegram Supervisor",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Email Supervisor (Gmail)",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Registro Incidente Crítico (Sheets)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Registro Incidente Crítico (Sheets)": {
+      "main": [
+        [
+          {
+            "node": "Evidencia Almacenada (Log URL)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Evidencia Almacenada (Log URL)": {
+      "main": [
+        [
+          {
+            "node": "Log Auditoría",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Preparar Registro Normal": {
+      "main": [
+        [
+          {
+            "node": "Registro Evento Normal (Sheets)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Registro Evento Normal (Sheets)": {
+      "main": [
+        [
+          {
+            "node": "Log Auditoría",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Auditoría": {
+      "main": [
+        [
+          {
+            "node": "Insertar Audit Log (Sheets)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insertar Audit Log (Sheets)": {
+      "main": [
+        [
+          {
+            "node": "Respond Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Formatear Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Formatear Error": {
+      "main": [
+        [
+          {
+            "node": "Notificar Error a DevOps",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Email Error (Gmail)",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Log Error (Sheets)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "versionId": "202d36d5-b4f7-4df0-8a12-4b02f82d6d55",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "1b326d955d35062b8e2eec1f8015b112ebe23d8d70c64371c33495c1147b9ece"
+  },
+  "nodeGroups": [],
+  "id": "zpYLkx7fOoXfuitb",
+  "tags": []
+}
